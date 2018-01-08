@@ -5,20 +5,27 @@
 //#define LOG_NDEBUG 0
 #define LOG_TAG "C2VDAComponent"
 
-#include <algorithm>
-
-#include "C2VDAAdaptor.h"
+#include <C2VDAAdaptor.h>
 #define __C2_GENERATE_GLOBAL_VARS__
-#include "C2VDAComponent.h"
-#include "base/bind.h"
-#include "base/bind_helpers.h"
-#include "videodev2.h"
+#include <C2VDAComponent.h>
+#include <C2VDASupport.h>
+
+#include <videodev2.h>
+
+#include <base/bind.h>
+#include <base/bind_helpers.h>
 
 #include <media/stagefright/MediaDefs.h>
 #include <utils/Log.h>
 #include <utils/misc.h>
 
-#define UNUSED(expr) do { (void)(expr); } while (0)
+#include <inttypes.h>
+#include <algorithm>
+
+#define UNUSED(expr)  \
+    do {              \
+        (void)(expr); \
+    } while (0)
 
 namespace android {
 
@@ -27,14 +34,13 @@ namespace {
 // Get index from C2param object. Use index to identify the type of the parameter.
 // Currently there is no wise way to get index from a parameter because index is private.
 uint32_t restoreIndex(const C2Param* param) {
-    return (param->forStream() ? (0x02000000 | ((param->stream() << 17) & 0x01FE0000)) : 0)
-            | param->type();
+    return (param->forStream() ? (0x02000000 | ((param->stream() << 17) & 0x01FE0000)) : 0) |
+           param->type();
 }
-
 
 // Helper function to allocate string type parameters.
 template <class T>
-std::unique_ptr<T> alloc_unique_cstr(const char* cstr) {
+std::unique_ptr<T> allocUniqueCstr(const char* cstr) {
     size_t len = strlen(cstr);
     std::unique_ptr<T> ptr = T::alloc_unique(len);
     memcpy(ptr->m.mValue, cstr, len);
@@ -45,24 +51,25 @@ template <class T>
 std::unique_ptr<C2SettingResult> reportReadOnlyFailure(C2Param* c2Param) {
     T* param = (T*)c2Param;
     return std::unique_ptr<C2SettingResult>(
-            new C2SettingResult { C2ParamField(param, &T::mValue),
-                                  C2SettingResult::READ_ONLY,
-                                  nullptr /* supportedValues */,
-                                  {} /* conflictedFields */ });
+            new C2SettingResult{C2SettingResult::READ_ONLY,
+                                {C2ParamField(param, &T::mValue), nullptr /* supportedValues */},
+                                {} /* conflictedFields */});
 }
 
 template <class T>
 std::unique_ptr<C2SettingResult> reportReadOnlyFlexFailure(C2Param* c2Param) {
     T* param = (T*)c2Param;
     return std::unique_ptr<C2SettingResult>(
-            new C2SettingResult { C2ParamField(param, &T::m),
-                                  C2SettingResult::READ_ONLY,
-                                  nullptr /* supportedValues */,
-                                  {} /* conflictedFields */ });
+            new C2SettingResult{C2SettingResult::READ_ONLY,
+                                {C2ParamField(param, &T::m), nullptr /* supportedValues */},
+                                {} /* conflictedFields */});
 }
 
 // Helper function to find int32_t value from C2Value::Primitive vector.
 bool findInt32FromPrimitiveValues(const int32_t& v, const C2FieldSupportedValues& values) {
+    if (values.type == C2FieldSupportedValues::EMPTY) {
+        return false;
+    }
     if (values.type == C2FieldSupportedValues::FLAGS) {
         ALOGE("Type of field supported values should not be FLAGS.");
         return false;
@@ -73,16 +80,15 @@ bool findInt32FromPrimitiveValues(const int32_t& v, const C2FieldSupportedValues
                ((v - values.range.min.i32) % values.range.step.i32 == 0);
     }
     // if values.type == C2FieldSupportedValues::VALUES
-    for (const auto& value : values.values) {
-        if (value.i32 == v) {
-            return true;
-        }
-    }
-    return false;
+    return std::any_of(values.values.begin(), values.values.end(),
+                       [v = v](const auto& value) { return value.i32 == v; });
 }
 
 // Helper function to find uint32_t value from C2Value::Primitive vector.
 bool findUint32FromPrimitiveValues(const uint32_t& v, const C2FieldSupportedValues& values) {
+    if (values.type == C2FieldSupportedValues::EMPTY) {
+        return false;
+    }
     if (values.type == C2FieldSupportedValues::FLAGS) {
         ALOGE("Type of field supported values should not be FLAGS.");
         return false;
@@ -93,75 +99,75 @@ bool findUint32FromPrimitiveValues(const uint32_t& v, const C2FieldSupportedValu
                ((v - values.range.min.u32) % values.range.step.u32 == 0);
     }
     // if values.type == C2FieldSupportedValues::VALUES
-    for (const auto& value : values.values) {
-        if (value.u32 == v) {
-            return true;
-        }
-    }
-    return false;
+    return std::any_of(values.values.begin(), values.values.end(),
+                       [v = v](const auto& value) { return value.u32 == v; });
 }
+
+// Mask against 30 bits to avoid (undefined) wraparound on signed integer.
+int32_t frameIndexToBitstreamId(uint64_t frameIndex) {
+    return static_cast<int32_t>(frameIndex & 0x3FFFFFFF);
+}
+
+const C2String kH264DecoderName = "v4l2.h264.decode";
+const C2String kVP8DecoderName = "v4l2.vp8.decode";
+const C2String kVP9DecoderName = "v4l2.vp9.decode";
 
 }  // namespace
 
-
-// Neglect flexible flag while matching parameter indices.
-#define CASE(paramType) \
-    case (paramType::baseIndex & ~(C2Param::BaseIndex::_kFlexibleFlag)): \
-        return std::unique_ptr<C2StructDescriptor>(new C2StructDescriptor{ \
-                paramType::baseIndex, paramType::fieldList, })
-
-class C2VDAComponentIntf::ParamReflector : public C2ParamReflector {
-public:
-    virtual std::unique_ptr<C2StructDescriptor> describe(C2Param::BaseIndex paramIndex) override {
-        switch (paramIndex.baseIndex()) {
-            //CASE(C2ComponentDomainInfo);  //TODO: known codec2 framework bug
-            CASE(C2StreamFormatConfig);
-            CASE(C2VideoSizeStreamInfo);
-            CASE(C2PortMimeConfig);
-            CASE(C2MaxVideoSizeHintPortSetting);
-        }
-        return nullptr;
+C2VDAComponentIntf::C2VDAComponentIntf(C2String name, c2_node_id_t id)
+      : kName(name),
+        kId(id),
+        mInitStatus(C2_OK),
+        mDomainInfo(C2DomainVideo),
+        mOutputColorFormat(0u, kColorFormatYUV420Flexible),
+        mOutputPortMime(allocUniqueCstr<C2PortMimeConfig::output>(MEDIA_MIMETYPE_VIDEO_RAW)),
+        mOutputBlockPools(C2PortBlockPoolsTuning::output::alloc_unique({})) {
+    // TODO(johnylin): use factory function to determine whether V4L2 stream or slice API is.
+    uint32_t inputFormatFourcc;
+    if (name == kH264DecoderName) {
+        mInputPortMime = allocUniqueCstr<C2PortMimeConfig::input>(MEDIA_MIMETYPE_VIDEO_AVC);
+        inputFormatFourcc = V4L2_PIX_FMT_H264_SLICE;
+    } else if (name == kVP8DecoderName) {
+        mInputPortMime = allocUniqueCstr<C2PortMimeConfig::input>(MEDIA_MIMETYPE_VIDEO_VP8);
+        inputFormatFourcc = V4L2_PIX_FMT_VP8_FRAME;
+    } else if (name == kVP9DecoderName) {
+        mInputPortMime = allocUniqueCstr<C2PortMimeConfig::input>(MEDIA_MIMETYPE_VIDEO_VP9);
+        inputFormatFourcc = V4L2_PIX_FMT_VP9_FRAME;
+    } else {
+        ALOGE("Invalid component name: %s", name.c_str());
+        mInitStatus = C2_BAD_VALUE;
+        return;
     }
-};
-
-#undef CASE
-
-// static
-const uint32_t C2VDAComponentIntf::kInputFormatFourcc = V4L2_PIX_FMT_H264_SLICE;
-
-C2VDAComponentIntf::C2VDAComponentIntf(C2String name, node_id id)
-    : kName(name),
-      kId(id),
-      mParamReflector(std::make_shared<ParamReflector>()),
-      mDomainInfo(C2DomainVideo),
-      mOutputColorFormat(0u, kColorFormatYUV420Flexible),
-      // Support H264 only for now.
-      mInputPortMime(alloc_unique_cstr<C2PortMimeConfig::input>(MEDIA_MIMETYPE_VIDEO_AVC)),
-      mOutputPortMime(alloc_unique_cstr<C2PortMimeConfig::output>(MEDIA_MIMETYPE_VIDEO_RAW)),
-      mSupportedProfiles(C2VDAAdaptor::GetSupportedProfiles(kInputFormatFourcc)) {
     // Get supported profiles from VDA.
-    CHECK_GT(mSupportedProfiles.size(), 0u);
+    // TODO: re-think the suitable method of getting supported profiles for both pure Android and
+    //       ARC++.
+    mSupportedProfiles = C2VDAAdaptor::GetSupportedProfiles(inputFormatFourcc);
+    if (mSupportedProfiles.empty()) {
+        ALOGE("No supported profile from input format: %u", inputFormatFourcc);
+        mInitStatus = C2_BAD_VALUE;
+        return;
+    }
 
     // Set default codec profile.
     mInputCodecProfile.mValue = mSupportedProfiles[0].profile;
 
-    mMinVideoSize = mSupportedProfiles[0].min_resolution;
-    mMaxVideoSize = mSupportedProfiles[0].max_resolution;
+    auto minVideoSize = mSupportedProfiles[0].min_resolution;
+    auto maxVideoSize = mSupportedProfiles[0].max_resolution;
     // Set default output video size.
-    mVideoSize.mWidth = mMinVideoSize.width();
-    mVideoSize.mHeight = mMinVideoSize.height();
+    mVideoSize.mWidth = minVideoSize.width();
+    mVideoSize.mHeight = minVideoSize.height();
     // Set default max video size.
-    mMaxVideoSizeHint.mWidth = mMaxVideoSize.width();
-    mMaxVideoSizeHint.mHeight = mMaxVideoSize.height();
+    mMaxVideoSizeHint.mWidth = maxVideoSize.width();
+    mMaxVideoSizeHint.mHeight = maxVideoSize.height();
 
     for (const auto& supportedProfile : mSupportedProfiles) {
         mSupportedCodecProfiles.push_back(supportedProfile.profile);
-        ALOGI("Get supported profile: profile=%d, min_res=%s, max_res=%s",
-              supportedProfile.profile, supportedProfile.min_resolution.ToString().c_str(),
+        ALOGI("Get supported profile: profile=%d, min_res=%s, max_res=%s", supportedProfile.profile,
+              supportedProfile.min_resolution.ToString().c_str(),
               supportedProfile.max_resolution.ToString().c_str());
     }
 
-    auto insertParam = [&params = mParams] (C2Param* param) {
+    auto insertParam = [& params = mParams](C2Param* param) {
         params[restoreIndex(param)] = param;
     };
 
@@ -171,60 +177,59 @@ C2VDAComponentIntf::C2VDAComponentIntf(C2String name, node_id id)
     insertParam(mOutputPortMime.get());
 
     insertParam(&mInputCodecProfile);
-    // TODO(johnylin): C2FieldSupportedValues for mInputCodecProfile should be VALUES type. But
-    // right now VALUES type only accepts initializer_list argument, we cannot pass a vector.
-    mSupportedValues.emplace(
-            C2ParamField(&mInputCodecProfile, &C2StreamFormatConfig::mValue),
-            C2FieldSupportedValues(
-                    mSupportedCodecProfiles.front(), mSupportedCodecProfiles.back(), 1u));
+    mSupportedValues.emplace(C2ParamField(&mInputCodecProfile, &C2StreamFormatConfig::mValue),
+                             C2FieldSupportedValues(false, mSupportedCodecProfiles));
 
     // TODO(johnylin): min/max resolution may change by chosen profile, we should dynamically change
     // the supported values in the future.
     insertParam(&mVideoSize);
     mSupportedValues.emplace(
             C2ParamField(&mVideoSize, &C2VideoSizeStreamInfo::mWidth),
-            C2FieldSupportedValues(mMinVideoSize.width(), mMaxVideoSize.width(), 16));
+            C2FieldSupportedValues(minVideoSize.width(), maxVideoSize.width(), 16));
     mSupportedValues.emplace(
             C2ParamField(&mVideoSize, &C2VideoSizeStreamInfo::mHeight),
-            C2FieldSupportedValues(mMinVideoSize.height(), mMaxVideoSize.height(), 16));
+            C2FieldSupportedValues(minVideoSize.height(), maxVideoSize.height(), 16));
 
     insertParam(&mMaxVideoSizeHint);
     mSupportedValues.emplace(
             C2ParamField(&mMaxVideoSizeHint, &C2MaxVideoSizeHintPortSetting::mWidth),
-            C2FieldSupportedValues(mMinVideoSize.width(), mMaxVideoSize.width(), 16));
+            C2FieldSupportedValues(minVideoSize.width(), maxVideoSize.width(), 16));
     mSupportedValues.emplace(
             C2ParamField(&mMaxVideoSizeHint, &C2MaxVideoSizeHintPortSetting::mHeight),
-            C2FieldSupportedValues(mMinVideoSize.height(), mMaxVideoSize.height(), 16));
+            C2FieldSupportedValues(minVideoSize.height(), maxVideoSize.height(), 16));
 
-    mParamDescs.push_back(std::make_shared<C2ParamDescriptor>(
-            true, "_domain", &mDomainInfo));
-    mParamDescs.push_back(std::make_shared<C2ParamDescriptor>(
-            false, "_output_color_format", &mOutputColorFormat));
-    mParamDescs.push_back(std::make_shared<C2ParamDescriptor>(
-            true, "_input_port_mime", mInputPortMime.get()));
-    mParamDescs.push_back(std::make_shared<C2ParamDescriptor>(
-            true, "_output_port_mime", mOutputPortMime.get()));
-    mParamDescs.push_back(std::make_shared<C2ParamDescriptor>(
-            false, "_input_codec_profile", &mInputCodecProfile));
-    mParamDescs.push_back(std::make_shared<C2ParamDescriptor>(
-            false, "_video_size", &mVideoSize));
-    mParamDescs.push_back(std::make_shared<C2ParamDescriptor>(
-            false, "_max_video_size_hint", &mMaxVideoSizeHint));
+    insertParam(mOutputBlockPools.get());
+
+    mParamDescs.push_back(std::make_shared<C2ParamDescriptor>(true, "_domain", &mDomainInfo));
+    mParamDescs.push_back(std::make_shared<C2ParamDescriptor>(false, "_output_color_format",
+                                                              &mOutputColorFormat));
+    mParamDescs.push_back(
+            std::make_shared<C2ParamDescriptor>(true, "_input_port_mime", mInputPortMime.get()));
+    mParamDescs.push_back(
+            std::make_shared<C2ParamDescriptor>(true, "_output_port_mime", mOutputPortMime.get()));
+    mParamDescs.push_back(std::make_shared<C2ParamDescriptor>(false, "_input_codec_profile",
+                                                              &mInputCodecProfile));
+    mParamDescs.push_back(std::make_shared<C2ParamDescriptor>(false, "_video_size", &mVideoSize));
+    mParamDescs.push_back(
+            std::make_shared<C2ParamDescriptor>(false, "_max_video_size_hint", &mMaxVideoSizeHint));
+    mParamDescs.push_back(std::make_shared<C2ParamDescriptor>(false, "_output_block_pools",
+                                                              mOutputBlockPools.get()));
 }
 
 C2String C2VDAComponentIntf::getName() const {
     return kName;
 }
 
-node_id C2VDAComponentIntf::getId() const {
+c2_node_id_t C2VDAComponentIntf::getId() const {
     return kId;
 }
 
-status_t C2VDAComponentIntf::query_nb(
+c2_status_t C2VDAComponentIntf::query_vb(
         const std::vector<C2Param* const>& stackParams,
-        const std::vector<C2Param::Index>& heapParamIndices,
+        const std::vector<C2Param::Index>& heapParamIndices, c2_blocking_t mayBlock,
         std::vector<std::unique_ptr<C2Param>>* const heapParams) const {
-    status_t err = C2_OK;
+    UNUSED(mayBlock);
+    c2_status_t err = C2_OK;
     for (C2Param* const param : stackParams) {
         if (!param || !*param) {
             continue;
@@ -255,10 +260,11 @@ status_t C2VDAComponentIntf::query_nb(
     return err;
 }
 
-status_t C2VDAComponentIntf::config_nb(
-        const std::vector<C2Param* const> &params,
+c2_status_t C2VDAComponentIntf::config_vb(
+        const std::vector<C2Param* const>& params, c2_blocking_t mayBlock,
         std::vector<std::unique_ptr<C2SettingResult>>* const failures) {
-    status_t err = C2_OK;
+    UNUSED(mayBlock);
+    c2_status_t err = C2_OK;
     for (C2Param* const param : params) {
         uint32_t index = restoreIndex(param);
         C2Param* myParam = getParamByIndex(index);
@@ -277,82 +283,87 @@ status_t C2VDAComponentIntf::config_nb(
             err = C2_BAD_VALUE;
             continue;
         } else if (index == restoreIndex(mInputPortMime.get())) {  // read-only
-            failures->push_back(
-                    reportReadOnlyFlexFailure<std::remove_pointer<decltype(mInputPortMime.get())>::type>(param));
+            failures->push_back(reportReadOnlyFlexFailure<
+                                std::remove_pointer<decltype(mInputPortMime.get())>::type>(param));
             err = C2_BAD_VALUE;
             continue;
         } else if (index == restoreIndex(mOutputPortMime.get())) {  // read-only
-            failures->push_back(
-                    reportReadOnlyFlexFailure<std::remove_pointer<decltype(mOutputPortMime.get())>::type>(param));
+            failures->push_back(reportReadOnlyFlexFailure<
+                                std::remove_pointer<decltype(mOutputPortMime.get())>::type>(param));
             err = C2_BAD_VALUE;
             continue;
         } else if (index == restoreIndex(&mInputCodecProfile)) {
-            std::unique_ptr<C2SettingResult> result = validateUint32Config<decltype(mInputCodecProfile)>(param);
+            std::unique_ptr<C2SettingResult> result =
+                    validateUint32Config<decltype(mInputCodecProfile)>(param);
             if (result) {
                 failures->push_back(std::move(result));
                 err = C2_BAD_VALUE;
                 continue;
             }
         } else if (index == restoreIndex(&mVideoSize)) {
-            std::unique_ptr<C2SettingResult> result = validateVideoSizeConfig<decltype(mVideoSize)>(param);
+            std::unique_ptr<C2SettingResult> result =
+                    validateVideoSizeConfig<decltype(mVideoSize)>(param);
             if (result) {
                 failures->push_back(std::move(result));
                 err = C2_BAD_VALUE;
                 continue;
             }
         } else if (index == restoreIndex(&mMaxVideoSizeHint)) {
-            std::unique_ptr<C2SettingResult> result = validateVideoSizeConfig<decltype(mMaxVideoSizeHint)>(param);
+            std::unique_ptr<C2SettingResult> result =
+                    validateVideoSizeConfig<decltype(mMaxVideoSizeHint)>(param);
             if (result) {
                 failures->push_back(std::move(result));
                 err = C2_BAD_VALUE;
                 continue;
             }
+        } else if (index == restoreIndex(mOutputBlockPools.get())) {
+            // setting output block pools
+            // TODO: add support for output-block-pools (this will be done when we move all
+            // config to shared ptr)
+            mOutputBlockPools.reset(
+                    static_cast<C2PortBlockPoolsTuning::output*>(C2Param::Copy(*param).release()));
+            continue;
         }
         myParam->updateFrom(*param);
     }
     return err;
 }
 
-status_t C2VDAComponentIntf::commit_sm(
-        const std::vector<C2Param* const>& params,
-        std::vector<std::unique_ptr<C2SettingResult>>* const failures) {
-    UNUSED(params);
-    UNUSED(failures);
-    return C2_NOT_IMPLEMENTED;
-}
-
-status_t C2VDAComponentIntf::createTunnel_sm(node_id targetComponent) {
+c2_status_t C2VDAComponentIntf::createTunnel_sm(c2_node_id_t targetComponent) {
     UNUSED(targetComponent);
-    return C2_UNSUPPORTED;  // Tunneling is not supported by now
+    return C2_OMITTED;  // Tunneling is not supported by now
 }
 
-status_t C2VDAComponentIntf::releaseTunnel_sm(node_id targetComponent) {
+c2_status_t C2VDAComponentIntf::releaseTunnel_sm(c2_node_id_t targetComponent) {
     UNUSED(targetComponent);
-    return C2_UNSUPPORTED;  // Tunneling is not supported by now
+    return C2_OMITTED;  // Tunneling is not supported by now
 }
 
-std::shared_ptr<C2ParamReflector> C2VDAComponentIntf::getParamReflector() const {
-    return mParamReflector;
-}
-
-status_t C2VDAComponentIntf::getSupportedParams(
+c2_status_t C2VDAComponentIntf::querySupportedParams_nb(
         std::vector<std::shared_ptr<C2ParamDescriptor>>* const params) const {
+    params->clear();
     params->insert(params->begin(), mParamDescs.begin(), mParamDescs.end());
     return C2_OK;
 }
 
-status_t C2VDAComponentIntf::getSupportedValues(
-        const std::vector<const C2ParamField>& fields,
-        std::vector<C2FieldSupportedValues>* const values) const {
-    status_t err = C2_OK;
-    for (const auto& field : fields) {
-        if (mSupportedValues.count(field) == 0) {
+c2_status_t C2VDAComponentIntf::querySupportedValues_vb(
+        std::vector<C2FieldSupportedValuesQuery>& fields, c2_blocking_t mayBlock) const {
+    UNUSED(mayBlock);
+    c2_status_t err = C2_OK;
+    for (auto& query : fields) {
+        if (mSupportedValues.count(query.field) == 0) {
+            query.status = C2_BAD_INDEX;
             err = C2_BAD_INDEX;
             continue;
         }
-        values->push_back(mSupportedValues.at(field));
+        query.status = C2_OK;
+        query.values = mSupportedValues.at(query.field);
     }
     return err;
+}
+
+c2_status_t C2VDAComponentIntf::status() const {
+    return mInitStatus;
 }
 
 C2Param* C2VDAComponentIntf::getParamByIndex(uint32_t index) const {
@@ -360,64 +371,55 @@ C2Param* C2VDAComponentIntf::getParamByIndex(uint32_t index) const {
     return (iter != mParams.end()) ? iter->second : nullptr;
 }
 
-template<class T>
+template <class T>
 std::unique_ptr<C2SettingResult> C2VDAComponentIntf::validateVideoSizeConfig(
         C2Param* c2Param) const {
     T* videoSize = (T*)c2Param;
 
     C2ParamField fieldWidth(videoSize, &T::mWidth);
-    const C2FieldSupportedValues &widths = mSupportedValues.at(fieldWidth);
+    const C2FieldSupportedValues& widths = mSupportedValues.at(fieldWidth);
     CHECK_EQ(widths.type, C2FieldSupportedValues::RANGE);
     if (!findInt32FromPrimitiveValues(videoSize->mWidth, widths)) {
-        std::unique_ptr<C2SettingResult> result(
-                new C2SettingResult { fieldWidth,
-                                      C2SettingResult::BAD_VALUE,
-                                      nullptr /* supportedValues */,
-                                      {} /* conflictinfFields */ });
-        result->supportedValues.reset(
-                new C2FieldSupportedValues(widths.range.min,
-                                           widths.range.max,
-                                           widths.range.step));
+        std::unique_ptr<C2SettingResult> result(new C2SettingResult{
+                C2SettingResult::BAD_VALUE,
+                {fieldWidth, std::make_unique<C2FieldSupportedValues>(
+                                     widths.range.min, widths.range.max, widths.range.step)},
+                {} /* conflicts */});
         return result;
     }
 
     C2ParamField fieldHeight(videoSize, &T::mHeight);
-    const C2FieldSupportedValues &heights = mSupportedValues.at(fieldHeight);
+    const C2FieldSupportedValues& heights = mSupportedValues.at(fieldHeight);
     CHECK_EQ(heights.type, C2FieldSupportedValues::RANGE);
     if (!findInt32FromPrimitiveValues(videoSize->mHeight, heights)) {
-        std::unique_ptr<C2SettingResult> result(
-                new C2SettingResult { fieldHeight,
-                                      C2SettingResult::BAD_VALUE,
-                                      nullptr /* supportedValues */,
-                                      {} /* conflictinfFields */ });
-        result->supportedValues.reset(
-                new C2FieldSupportedValues(heights.range.min,
-                                           heights.range.max,
-                                           heights.range.step));
+        std::unique_ptr<C2SettingResult> result(new C2SettingResult{
+                C2SettingResult::BAD_VALUE,
+                {fieldHeight, std::make_unique<C2FieldSupportedValues>(
+                                      heights.range.min, heights.range.max, heights.range.step)},
+                {} /* conflicts */});
         return result;
     }
 
     return nullptr;
 }
 
-template<class T>
-std::unique_ptr<C2SettingResult> C2VDAComponentIntf::validateUint32Config(
-        C2Param* c2Param) const {
+template <class T>
+std::unique_ptr<C2SettingResult> C2VDAComponentIntf::validateUint32Config(C2Param* c2Param) const {
     T* config = (T*)c2Param;
 
     C2ParamField field(config, &T::mValue);
-    const C2FieldSupportedValues &configs = mSupportedValues.at(field);
-    CHECK_EQ(configs.type, C2FieldSupportedValues::RANGE);
+    const C2FieldSupportedValues& configs = mSupportedValues.at(field);
     if (!findUint32FromPrimitiveValues(config->mValue, configs)) {
-        std::unique_ptr<C2SettingResult> result(
-                new C2SettingResult { field,
-                                      C2SettingResult::BAD_VALUE,
-                                      nullptr /* supportedValues */,
-                                      {} /* conflictinfFields */ });
-        result->supportedValues.reset(
-                new C2FieldSupportedValues(configs.range.min,
-                                           configs.range.max,
-                                           configs.range.step));
+        std::unique_ptr<C2SettingResult> result(new C2SettingResult{
+                C2SettingResult::BAD_VALUE, {field, nullptr}, {} /* conflicts */});
+        if (configs.type == C2FieldSupportedValues::RANGE) {
+            result->field.values.reset(new C2FieldSupportedValues(
+                    configs.range.min, configs.range.max, configs.range.step));
+        } else if (configs.type == C2FieldSupportedValues::VALUES) {
+            result->field.values.reset(new C2FieldSupportedValues(false, configs.values));
+        } else {
+            return nullptr;
+        }
         return result;
     }
 
@@ -425,19 +427,63 @@ std::unique_ptr<C2SettingResult> C2VDAComponentIntf::validateUint32Config(
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+#define EXPECT_STATE_OR_RETURN_ON_ERROR(x)                    \
+    do {                                                      \
+        if (mComponentState == ComponentState::ERROR) return; \
+        CHECK_EQ(mComponentState, ComponentState::x);         \
+    } while (0)
 
-C2VDAComponent::C2VDAComponent(C2String name,
-                               node_id id,
-                               const std::shared_ptr<C2ComponentListener>& listener)
-    : mIntf(std::make_shared<C2VDAComponentIntf>(name, id)),
-      mListener(listener),
-      mThread("C2VDAComponentThread"),
-      mVDAInitResult(VideoDecodeAcceleratorAdaptor::Result::ILLEGAL_STATE),
-      mComponentState(ComponentState::UNINITIALIZED),
-      mCodecProfile(media::VIDEO_CODEC_PROFILE_UNKNOWN),
-      mState(State::UNLOADED) {
+#define EXPECT_RUNNING_OR_RETURN_ON_ERROR()                       \
+    do {                                                          \
+        if (mComponentState == ComponentState::ERROR) return;     \
+        CHECK_NE(mComponentState, ComponentState::UNINITIALIZED); \
+    } while (0)
+
+class C2VDAGraphicBuffer : public C2Buffer {
+public:
+    C2VDAGraphicBuffer(const std::shared_ptr<C2GraphicBlock>& block,
+                       const base::Closure& releaseCB);
+    ~C2VDAGraphicBuffer() override;
+
+private:
+    base::Closure mReleaseCB;
+};
+
+C2VDAGraphicBuffer::C2VDAGraphicBuffer(const std::shared_ptr<C2GraphicBlock>& block,
+                                       const base::Closure& releaseCB)
+      : C2Buffer({block->share(C2Rect(block->width(), block->height()), C2Fence())}),
+        mReleaseCB(releaseCB) {}
+
+C2VDAGraphicBuffer::~C2VDAGraphicBuffer() {
+    if (!mReleaseCB.is_null()) {
+        mReleaseCB.Run();
+    }
+}
+
+C2VDAComponent::VideoFormat::VideoFormat(uint32_t pixelFormat, uint32_t minNumBuffers,
+                                         media::Size codedSize, media::Rect visibleRect)
+      : mPixelFormat(pixelFormat),
+        mMinNumBuffers(minNumBuffers),
+        mCodedSize(codedSize),
+        mVisibleRect(visibleRect) {}
+
+C2VDAComponent::C2VDAComponent(C2String name, c2_node_id_t id)
+      : mIntf(std::make_shared<C2VDAComponentIntf>(name, id)),
+        mThread("C2VDAComponentThread"),
+        mVDAInitResult(VideoDecodeAcceleratorAdaptor::Result::ILLEGAL_STATE),
+        mComponentState(ComponentState::UNINITIALIZED),
+        mColorFormat(0u),
+        mLastOutputTimestamp(-1),
+        mCodecProfile(media::VIDEO_CODEC_PROFILE_UNKNOWN),
+        mState(State::UNLOADED),
+        mWeakThisFactory(this) {
+    // TODO(johnylin): the client may need to know if init is failed.
+    if (mIntf->status() != C2_OK) {
+        ALOGE("Component interface init failed (err code = %d)", mIntf->status());
+        return;
+    }
     if (!mThread.Start()) {
-        ALOGE("Component thread failed to start");
+        ALOGE("Component thread failed to start.");
         return;
     }
     mTaskRunner = mThread.task_runner();
@@ -449,17 +495,16 @@ C2VDAComponent::~C2VDAComponent() {
     CHECK_EQ(mState, State::LOADED);
 
     if (mThread.IsRunning()) {
-        mTaskRunner->PostTask(
-                FROM_HERE, base::Bind(&C2VDAComponent::onDestroy, base::Unretained(this)));
+        mTaskRunner->PostTask(FROM_HERE,
+                              base::Bind(&C2VDAComponent::onDestroy, base::Unretained(this)));
         mThread.Stop();
     }
-    CHECK(!mThread.IsRunning());
 }
 
-void C2VDAComponent::getParameters() {
+void C2VDAComponent::fetchParametersFromIntf() {
     C2StreamFormatConfig::input codecProfile;
-    std::vector<C2Param* const> stackParams{ &codecProfile };
-    CHECK_EQ(mIntf->query_nb(stackParams, {}, nullptr), C2_OK);
+    std::vector<C2Param* const> stackParams{&codecProfile};
+    CHECK_EQ(mIntf->query_vb(stackParams, {}, C2_DONT_BLOCK, nullptr), C2_OK);
     // The value should be guaranteed to be within media::VideoCodecProfile enum range by component
     // interface.
     mCodecProfile = static_cast<media::VideoCodecProfile>(codecProfile.mValue);
@@ -475,7 +520,10 @@ void C2VDAComponent::onCreate() {
 void C2VDAComponent::onDestroy() {
     DCHECK(mTaskRunner->BelongsToCurrentThread());
     ALOGV("onDestroy");
-    mVDAAdaptor.reset(nullptr);
+    if (mVDAAdaptor.get()) {
+        mVDAAdaptor->destroy();
+        mVDAAdaptor.reset(nullptr);
+    }
 }
 
 void C2VDAComponent::onStart(media::VideoCodecProfile profile, base::WaitableEvent* done) {
@@ -488,64 +536,567 @@ void C2VDAComponent::onStart(media::VideoCodecProfile profile, base::WaitableEve
     if (mVDAInitResult == VideoDecodeAcceleratorAdaptor::Result::SUCCESS) {
         mComponentState = ComponentState::STARTED;
     }
+
     done->Signal();
+}
+
+void C2VDAComponent::onQueueWork(std::unique_ptr<C2Work> work) {
+    DCHECK(mTaskRunner->BelongsToCurrentThread());
+    ALOGV("onQueueWork");
+    EXPECT_RUNNING_OR_RETURN_ON_ERROR();
+    // It is illegal for client to put new works while component is still flushing.
+    CHECK_NE(mComponentState, ComponentState::FLUSHING);
+    mQueue.emplace(std::move(work));
+    // TODO(johnylin): set a maximum size of mQueue and check if mQueue is already full.
+
+    mTaskRunner->PostTask(FROM_HERE,
+                          base::Bind(&C2VDAComponent::onDequeueWork, base::Unretained(this)));
+}
+
+void C2VDAComponent::onDequeueWork() {
+    DCHECK(mTaskRunner->BelongsToCurrentThread());
+    ALOGV("onDequeueWork");
+    EXPECT_RUNNING_OR_RETURN_ON_ERROR();
+    if (mQueue.empty()) {
+        return;
+    }
+    if (mComponentState == ComponentState::DRAINING) {
+        ALOGV("Temporarily stop dequeueing works since component is draining.");
+        return;
+    }
+    if (mComponentState != ComponentState::STARTED) {
+        ALOGE("Work queue should be empty if the component is not in STARTED state.");
+        return;
+    }
+
+    // Dequeue a work from mQueue.
+    std::unique_ptr<C2Work> work(std::move(mQueue.front()));
+    mQueue.pop();
+
+    // Send input buffer to VDA for decode.
+    // Use frame_index as bitstreamId.
+    CHECK_EQ(work->input.buffers.size(), 1u);
+    C2ConstLinearBlock linearBlock = work->input.buffers.front()->data().linearBlocks().front();
+    if (linearBlock.size() > 0) {
+        int32_t bitstreamId = frameIndexToBitstreamId(work->input.ordinal.frame_index);
+        sendInputBufferToAccelerator(linearBlock, bitstreamId);
+    }
+
+    if (work->input.flags & C2BufferPack::FLAG_END_OF_STREAM) {
+        mVDAAdaptor->flush();
+        mComponentState = ComponentState::DRAINING;
+    }
+
+    // Put work to mPendingWork.
+    mPendingWorks.emplace_back(std::move(work));
+
+    if (!mQueue.empty()) {
+        mTaskRunner->PostTask(FROM_HERE,
+                              base::Bind(&C2VDAComponent::onDequeueWork, base::Unretained(this)));
+    }
+}
+
+void C2VDAComponent::onInputBufferDone(int32_t bitstreamId) {
+    DCHECK(mTaskRunner->BelongsToCurrentThread());
+    ALOGV("onInputBufferDone: bitstream id=%d", bitstreamId);
+    EXPECT_RUNNING_OR_RETURN_ON_ERROR();
+
+    C2Work* work = getPendingWorkByBitstreamId(bitstreamId);
+    if (!work) {
+        reportError(C2_CORRUPTED);
+        return;
+    }
+
+    // When the work is done, the input buffers vector shall be cleared by component.
+    work->input.buffers.clear();
+
+    reportFinishedWorkIfAny();
+}
+
+// This is used as callback while output buffer is released by client.
+// TODO(johnylin): consider to use C2Buffer::registerOnDestroyNotify instead
+void C2VDAComponent::returnOutputBuffer(int32_t pictureBufferId) {
+    mTaskRunner->PostTask(FROM_HERE, base::Bind(&C2VDAComponent::onOutputBufferReturned,
+                                                base::Unretained(this), pictureBufferId));
+}
+
+void C2VDAComponent::onOutputBufferReturned(int32_t pictureBufferId) {
+    DCHECK(mTaskRunner->BelongsToCurrentThread());
+    ALOGV("onOutputBufferReturned: picture id=%d", pictureBufferId);
+    EXPECT_RUNNING_OR_RETURN_ON_ERROR();
+
+    GraphicBlockInfo* info = getGraphicBlockById(pictureBufferId);
+    if (!info) {
+        reportError(C2_CORRUPTED);
+        return;
+    }
+    CHECK_EQ(info->mState, GraphicBlockInfo::State::OWNED_BY_CLIENT);
+    info->mState = GraphicBlockInfo::State::OWNED_BY_COMPONENT;
+
+    if (mPendingOutputFormat) {
+        tryChangeOutputFormat();
+    } else {
+        sendOutputBufferToAccelerator(info);
+    }
+}
+
+void C2VDAComponent::onOutputBufferDone(int32_t pictureBufferId, int32_t bitstreamId) {
+    DCHECK(mTaskRunner->BelongsToCurrentThread());
+    ALOGV("onOutputBufferDone: picture id=%d, bitstream id=%d", pictureBufferId, bitstreamId);
+    EXPECT_RUNNING_OR_RETURN_ON_ERROR();
+
+    C2Work* work = getPendingWorkByBitstreamId(bitstreamId);
+    if (!work) {
+        reportError(C2_CORRUPTED);
+        return;
+    }
+    GraphicBlockInfo* info = getGraphicBlockById(pictureBufferId);
+    if (!info) {
+        reportError(C2_CORRUPTED);
+        return;
+    }
+    CHECK_EQ(info->mState, GraphicBlockInfo::State::OWNED_BY_ACCELERATOR);
+    // Output buffer will be passed to client soon along with mListener->onWorkDone_nb().
+    info->mState = GraphicBlockInfo::State::OWNED_BY_CLIENT;
+
+    // Attach output buffer to the work corresponded to bitstreamId.
+    CHECK_EQ(work->worklets.size(), 1u);
+    work->worklets.front()->output.buffers.clear();
+    work->worklets.front()->output.buffers.emplace_back(std::make_shared<C2VDAGraphicBuffer>(
+            info->mGraphicBlock, base::Bind(&C2VDAComponent::returnOutputBuffer,
+                                            mWeakThisFactory.GetWeakPtr(), pictureBufferId)));
+    work->worklets.front()->output.ordinal = work->input.ordinal;
+    work->worklets_processed = 1u;
+
+    int64_t currentTimestamp = base::checked_cast<int64_t>(work->input.ordinal.timestamp);
+    CHECK_GE(currentTimestamp, mLastOutputTimestamp);
+    mLastOutputTimestamp = currentTimestamp;
+
+    reportFinishedWorkIfAny();
+}
+
+void C2VDAComponent::onDrain() {
+    DCHECK(mTaskRunner->BelongsToCurrentThread());
+    ALOGV("onDrain");
+    EXPECT_STATE_OR_RETURN_ON_ERROR(STARTED);
+
+    // Set input flag as C2BufferPack::FLAG_END_OF_STREAM to the last queued work. If mQueue is
+    // empty, set to the last work in mPendingWorks and then signal flush immediately.
+    if (!mQueue.empty()) {
+        mQueue.back()->input.flags = static_cast<C2BufferPack::flags_t>(
+                mQueue.back()->input.flags | C2BufferPack::FLAG_END_OF_STREAM);
+    } else if (!mPendingWorks.empty()) {
+        C2Work* work = getPendingWorkLastToFinish();
+        if (!work) {
+            reportError(C2_CORRUPTED);
+            return;
+        }
+        mPendingWorks.back()->input.flags = static_cast<C2BufferPack::flags_t>(
+                mPendingWorks.back()->input.flags | C2BufferPack::FLAG_END_OF_STREAM);
+        mVDAAdaptor->flush();
+        mComponentState = ComponentState::DRAINING;
+    } else {
+        // Do nothing.
+        ALOGV("No buffers in VDA, drain takes no effect.");
+    }
+}
+
+void C2VDAComponent::onDrainDone() {
+    DCHECK(mTaskRunner->BelongsToCurrentThread());
+    ALOGV("onDrainDone");
+    if (mComponentState == ComponentState::DRAINING) {
+        mComponentState = ComponentState::STARTED;
+    } else if (mComponentState == ComponentState::STOPPING) {
+        // The client signals stop right before VDA notifies drain done. Let stop process goes.
+        return;
+    } else {
+        ALOGE("Unexpected state while onDrainDone(). State=%d", mComponentState);
+        reportError(C2_BAD_STATE);
+        return;
+    }
+
+    // Last stream is finished. Reset the timestamp record.
+    mLastOutputTimestamp = -1;
+
+    // Work dequeueing was stopped while component draining. Restart it.
+    mTaskRunner->PostTask(FROM_HERE,
+                          base::Bind(&C2VDAComponent::onDequeueWork, base::Unretained(this)));
+}
+
+void C2VDAComponent::onFlush() {
+    DCHECK(mTaskRunner->BelongsToCurrentThread());
+    ALOGV("onFlush");
+    EXPECT_STATE_OR_RETURN_ON_ERROR(STARTED);
+
+    mVDAAdaptor->reset();
+    // Pop all works in mQueue and put into mPendingWorks.
+    while (!mQueue.empty()) {
+        mPendingWorks.emplace_back(std::move(mQueue.front()));
+        mQueue.pop();
+    }
+    mComponentState = ComponentState::FLUSHING;
 }
 
 void C2VDAComponent::onStop(base::WaitableEvent* done) {
     DCHECK(mTaskRunner->BelongsToCurrentThread());
     ALOGV("onStop");
-    CHECK(mComponentState != ComponentState::UNINITIALIZED);
+    EXPECT_RUNNING_OR_RETURN_ON_ERROR();
+
     mVDAAdaptor->reset();
+    // Pop all works in mQueue and put into mPendingWorks.
+    while (!mQueue.empty()) {
+        mPendingWorks.emplace_back(std::move(mQueue.front()));
+        mQueue.pop();
+    }
+
     mStopDoneEvent = done;  // restore done event which shoud be signaled in onStopDone().
     mComponentState = ComponentState::STOPPING;
 }
 
-void C2VDAComponent::onStopDone() {
+void C2VDAComponent::onResetDone() {
     DCHECK(mTaskRunner->BelongsToCurrentThread());
+    if (mComponentState == ComponentState::ERROR) {
+        return;
+    }
+    if (mComponentState == ComponentState::FLUSHING) {
+        onFlushDone();
+    } else if (mComponentState == ComponentState::STOPPING) {
+        onStopDone();
+    } else {
+        reportError(C2_CORRUPTED);
+    }
+}
+
+void C2VDAComponent::onFlushDone() {
+    ALOGV("onFlushDone");
+    reportAbandonedWorks();
+    // Reset the timestamp record.
+    mLastOutputTimestamp = -1;
+    mComponentState = ComponentState::STARTED;
+}
+
+void C2VDAComponent::onStopDone() {
     ALOGV("onStopDone");
-    CHECK(mComponentState == ComponentState::STOPPING);
     CHECK(mStopDoneEvent);
-    mVDAAdaptor->destroy();
+
+    // Release the graphic block allocator object.
+    mOutputBlockPool.reset();
+
+    // TODO(johnylin): At this moment, there may be C2Buffer still owned by client, do we need to
+    // do something for them?
+    reportAbandonedWorks();
+    mPendingOutputFormat.reset();
+    mColorFormat = 0u;
+    mLastOutputTimestamp = -1;
+    if (mVDAAdaptor.get()) {
+        mVDAAdaptor->destroy();
+        mVDAAdaptor.reset(nullptr);
+    }
+
+    mGraphicBlocks.clear();
+
     mStopDoneEvent->Signal();
     mStopDoneEvent = nullptr;
     mComponentState = ComponentState::UNINITIALIZED;
 }
 
-status_t C2VDAComponent::queue_nb(std::list<std::unique_ptr<C2Work>>* const items) {
+c2_status_t C2VDAComponent::setListener_vb(const std::shared_ptr<C2Component::Listener>& listener,
+                                           c2_blocking_t mayBlock) {
+    UNUSED(mayBlock);
+    // TODO(johnylin): API says this method must be supported in all states, however I'm quite not
+    //                 sure what is the use case.
+    if (mState != State::LOADED) {
+        return C2_BAD_STATE;
+    }
+    mListener = listener;
+    return C2_OK;
+}
+
+void C2VDAComponent::sendInputBufferToAccelerator(const C2ConstLinearBlock& input,
+                                                  int32_t bitstreamId) {
+    ALOGV("sendInputBufferToAccelerator");
+    int dupFd = dup(input.handle()->data[0]);
+    if (dupFd < 0) {
+        ALOGE("Failed to dup(%d) input buffer (bitstreamId=%d), errno=%d", input.handle()->data[0],
+              bitstreamId, errno);
+        reportError(C2_CORRUPTED);
+        return;
+    }
+    ALOGV("Decode bitstream ID: %d, offset: %u size: %u", bitstreamId, input.offset(),
+          input.size());
+    mVDAAdaptor->decode(bitstreamId, dupFd, input.offset(), input.size());
+}
+
+C2Work* C2VDAComponent::getPendingWorkByBitstreamId(int32_t bitstreamId) {
+    auto workIter = std::find_if(mPendingWorks.begin(), mPendingWorks.end(),
+                                 [bitstreamId](const std::unique_ptr<C2Work>& w) {
+                                     return frameIndexToBitstreamId(w->input.ordinal.frame_index) ==
+                                            bitstreamId;
+                                 });
+
+    if (workIter == mPendingWorks.end()) {
+        ALOGE("Can't find pending work by bitstream ID: %d", bitstreamId);
+        return nullptr;
+    }
+    return workIter->get();
+}
+
+C2Work* C2VDAComponent::getPendingWorkLastToFinish() {
+    // Get the work with largest timestamp.
+    auto workIter = std::max_element(
+            mPendingWorks.begin(), mPendingWorks.end(), [](const auto& w1, const auto& w2) {
+                return w1->input.ordinal.timestamp < w2->input.ordinal.timestamp;
+            });
+
+    if (workIter == mPendingWorks.end()) {
+        ALOGE("Can't get last finished work from mPendingWork");
+        return nullptr;
+    }
+    return workIter->get();
+}
+
+C2VDAComponent::GraphicBlockInfo* C2VDAComponent::getGraphicBlockById(int32_t blockId) {
+    if (blockId < 0 || blockId >= static_cast<int32_t>(mGraphicBlocks.size())) {
+        ALOGE("getGraphicBlockById failed: id=%d", blockId);
+        return nullptr;
+    }
+    return &mGraphicBlocks[blockId];
+}
+
+void C2VDAComponent::onOutputFormatChanged(std::unique_ptr<VideoFormat> format) {
+    DCHECK(mTaskRunner->BelongsToCurrentThread());
+    ALOGV("onOutputFormatChanged");
+    EXPECT_RUNNING_OR_RETURN_ON_ERROR();
+
+    ALOGV("New output format(pixel_format=0x%x, min_num_buffers=%u, coded_size=%s, crop_rect=%s)",
+          format->mPixelFormat, format->mMinNumBuffers, format->mCodedSize.ToString().c_str(),
+          format->mVisibleRect.ToString().c_str());
+
+    for (auto& info : mGraphicBlocks) {
+        if (info.mState == GraphicBlockInfo::State::OWNED_BY_ACCELERATOR)
+            info.mState = GraphicBlockInfo::State::OWNED_BY_COMPONENT;
+    }
+
+    CHECK(!mPendingOutputFormat);
+    mPendingOutputFormat = std::move(format);
+    tryChangeOutputFormat();
+}
+
+void C2VDAComponent::tryChangeOutputFormat() {
+    DCHECK(mTaskRunner->BelongsToCurrentThread());
+    ALOGV("tryChangeOutputFormat");
+    CHECK(mPendingOutputFormat);
+
+    // Change the output format only after all output buffers are returned
+    // from clients.
+    for (const auto& info : mGraphicBlocks) {
+        if (info.mState == GraphicBlockInfo::State::OWNED_BY_CLIENT) {
+            ALOGV("wait buffer: %d for output format change", info.mBlockId);
+            return;
+        }
+    }
+
+    uint32_t colorFormat;
+    int bufferFormat;
+    switch (mPendingOutputFormat->mPixelFormat) {
+    case HAL_PIXEL_FORMAT_YCbCr_420_888:
+        colorFormat = kColorFormatYUV420Flexible;
+        bufferFormat = HAL_PIXEL_FORMAT_YCbCr_420_888;
+        break;
+    default:
+        ALOGE("pixel format: 0x%x is not supported", mPendingOutputFormat->mPixelFormat);
+        reportError(C2_OMITTED);
+        return;
+    }
+
+    mOutputFormat.mPixelFormat = mPendingOutputFormat->mPixelFormat;
+    mOutputFormat.mMinNumBuffers = mPendingOutputFormat->mMinNumBuffers;
+    mOutputFormat.mCodedSize = mPendingOutputFormat->mCodedSize;
+
+    setOutputFormatCrop(mPendingOutputFormat->mVisibleRect);
+    mColorFormat = colorFormat;
+
+    c2_status_t err =
+            allocateBuffersFromBlockAllocator(mPendingOutputFormat->mCodedSize, bufferFormat);
+    if (err != C2_OK) {
+        reportError(err);
+        return;
+    }
+
+    for (auto& info : mGraphicBlocks) {
+        sendOutputBufferToAccelerator(&info);
+    }
+    mPendingOutputFormat.reset();
+}
+
+c2_status_t C2VDAComponent::allocateBuffersFromBlockAllocator(const media::Size& size,
+                                                              int pixelFormat) {
+    ALOGV("allocateBuffersFromBlockAllocator(%s, 0x%x)", size.ToString().c_str(), pixelFormat);
+
+    size_t bufferCount = mOutputFormat.mMinNumBuffers + kDpbOutputBufferExtraCount;
+
+    // Allocate the output buffers.
+    mVDAAdaptor->assignPictureBuffers(bufferCount);
+
+    // TODO: lock access to interface
+    C2BlockPool::local_id_t poolId = mIntf->mOutputBlockPools->flexCount()
+                                             ? mIntf->mOutputBlockPools->m.mValues[0]
+                                             : C2BlockPool::BASIC_GRAPHIC;
+    ALOGI("Using C2BlockPool ID = %" PRIu64 " for allocating output buffers", poolId);
+    c2_status_t err;
+    if (!mOutputBlockPool || mOutputBlockPool->getLocalId() != poolId) {
+        err = getCodec2BlockPool(poolId, shared_from_this(), &mOutputBlockPool);
+        if (err != C2_OK) {
+            ALOGE("Graphic block allocator is invalid");
+            reportError(err);
+            return err;
+        }
+    }
+
+    mGraphicBlocks.clear();
+    for (size_t i = 0; i < bufferCount; ++i) {
+        std::shared_ptr<C2GraphicBlock> block;
+        C2MemoryUsage usage = {C2MemoryUsage::kSoftwareRead, 0};
+        err = mOutputBlockPool->fetchGraphicBlock(size.width(), size.height(), pixelFormat, usage,
+                                                  &block);
+        if (err != C2_OK) {
+            mGraphicBlocks.clear();
+            ALOGE("failed to allocate buffer: %d", err);
+            reportError(err);
+            return err;
+        }
+        appendOutputBuffer(std::move(block));
+    }
+    mOutputFormat.mMinNumBuffers = bufferCount;
+    return C2_OK;
+}
+
+void C2VDAComponent::appendOutputBuffer(std::shared_ptr<C2GraphicBlock> block) {
+    GraphicBlockInfo info;
+    info.mBlockId = mGraphicBlocks.size();
+    info.mGraphicBlock = std::move(block);
+
+    const C2GraphicView& view = info.mGraphicBlock->map().get();
+    const uint8_t* const* data = view.data();
+    CHECK_NE(data, nullptr);
+    const C2PlaneLayout& layout = view.layout();
+
+    ALOGV("allocate graphic buffer: %p, id: %u, size: %dx%d", info.mGraphicBlock->handle(),
+          info.mBlockId, info.mGraphicBlock->width(), info.mGraphicBlock->height());
+
+    // get offset from data pointers
+    uint32_t offsets[C2PlaneLayout::MAX_NUM_PLANES];
+    auto baseAddress = reinterpret_cast<intptr_t>(data[0]);
+    for (uint32_t i = 0; i < layout.mNumPlanes; ++i) {
+        auto planeAddress = reinterpret_cast<intptr_t>(data[i]);
+        offsets[i] = static_cast<uint32_t>(planeAddress - baseAddress);
+    }
+
+    for (uint32_t i = 0; i < layout.mNumPlanes; ++i) {
+        ALOGV("plane %u: stride: %d, offset: %u", i, layout.mPlanes[i].mRowInc, offsets[i]);
+    }
+
+    base::ScopedFD passedHandle(dup(info.mGraphicBlock->handle()->data[0]));
+    if (!passedHandle.is_valid()) {
+        ALOGE("Failed to dup(%d), errno=%d", info.mGraphicBlock->handle()->data[0], errno);
+        reportError(C2_CORRUPTED);
+        return;
+    }
+    std::vector<VideoFramePlane> passedPlanes;
+    for (uint32_t i = 0; i < layout.mNumPlanes; ++i) {
+        CHECK_GT(layout.mPlanes[i].mRowInc, 0);
+        passedPlanes.push_back({offsets[i], static_cast<uint32_t>(layout.mPlanes[i].mRowInc)});
+    }
+    info.mHandle = std::move(passedHandle);
+    info.mPlanes = std::move(passedPlanes);
+
+    mGraphicBlocks.push_back(std::move(info));
+}
+
+void C2VDAComponent::sendOutputBufferToAccelerator(GraphicBlockInfo* info) {
+    ALOGV("sendOutputBufferToAccelerator index=%d", info->mBlockId);
+    CHECK_EQ(info->mState, GraphicBlockInfo::State::OWNED_BY_COMPONENT);
+    info->mState = GraphicBlockInfo::State::OWNED_BY_ACCELERATOR;
+
+    // is_valid() is true for the first time the buffer is passed to VDA. In that case, VDA needs to
+    // import the buffer first.
+    if (info->mHandle.is_valid()) {
+        mVDAAdaptor->importBufferForPicture(info->mBlockId, info->mHandle.release(), info->mPlanes);
+    } else {
+        mVDAAdaptor->reusePictureBuffer(info->mBlockId);
+    }
+}
+
+void C2VDAComponent::onVisibleRectChanged(const media::Rect& cropRect) {
+    DCHECK(mTaskRunner->BelongsToCurrentThread());
+    ALOGV("onVisibleRectChanged");
+    EXPECT_RUNNING_OR_RETURN_ON_ERROR();
+
+    // We should make sure there is no pending output format change. That is, the input cropRect is
+    // corresponding to current output format.
+    CHECK(mPendingOutputFormat == nullptr);
+    setOutputFormatCrop(cropRect);
+}
+
+void C2VDAComponent::setOutputFormatCrop(const media::Rect& cropRect) {
+    ALOGV("setOutputFormatCrop(%dx%d)", cropRect.width(), cropRect.height());
+    mOutputFormat.mVisibleRect = cropRect;
+    // TODO(johnylin): what else do we need to do? crop rect could be an info requested from
+    // framework by requestedInfos in worklets.
+}
+
+c2_status_t C2VDAComponent::queue_nb(std::list<std::unique_ptr<C2Work>>* const items) {
+    if (mState != State::RUNNING) {
+        return C2_BAD_STATE;
+    }
+    while (!items->empty()) {
+        mTaskRunner->PostTask(FROM_HERE,
+                              base::Bind(&C2VDAComponent::onQueueWork, base::Unretained(this),
+                                         base::Passed(&items->front())));
+        items->pop_front();
+    }
+    return C2_OK;
+}
+
+c2_status_t C2VDAComponent::announce_nb(const std::vector<C2WorkOutline>& items) {
     UNUSED(items);
-    return C2_NOT_IMPLEMENTED;
+    return C2_OMITTED;  // Tunneling is not supported by now
 }
 
-status_t C2VDAComponent::announce_nb(const std::vector<C2WorkOutline>& items) {
-    UNUSED(items);
-    return C2_UNSUPPORTED;  // Tunneling is not supported by now
+c2_status_t C2VDAComponent::flush_sm(flush_mode_t mode,
+                                     std::list<std::unique_ptr<C2Work>>* const flushedWork) {
+    if (mode != FLUSH_COMPONENT) {
+        return C2_OMITTED;  // Tunneling is not supported by now
+    }
+    if (mState != State::RUNNING) {
+        return C2_BAD_STATE;
+    }
+    mTaskRunner->PostTask(FROM_HERE, base::Bind(&C2VDAComponent::onFlush, base::Unretained(this)));
+    // Instead of |flushedWork|, abandoned works will be returned via onWorkDone_nb() callback.
+    return C2_OK;
 }
 
-status_t C2VDAComponent::flush_sm(
-        bool flushThrough, std::list<std::unique_ptr<C2Work>>* const flushedWork) {
-    if (flushThrough)
-        return C2_UNSUPPORTED;  // Tunneling is not supported by now
-    UNUSED(flushedWork);
-    return C2_NOT_IMPLEMENTED;
+c2_status_t C2VDAComponent::drain_nb(drain_mode_t mode) {
+    if (mode != DRAIN_COMPONENT_WITH_EOS) {
+        return C2_OMITTED;  // Tunneling is not supported by now
+    }
+    if (mState != State::RUNNING) {
+        return C2_BAD_STATE;
+    }
+    mTaskRunner->PostTask(FROM_HERE, base::Bind(&C2VDAComponent::onDrain, base::Unretained(this)));
+    return C2_OK;
 }
 
-status_t C2VDAComponent::drain_nb(bool drainThrough) {
-    if (drainThrough)
-        return C2_UNSUPPORTED;  // Tunneling is not supported by now
-    return C2_NOT_IMPLEMENTED;
-}
-
-status_t C2VDAComponent::start() {
+c2_status_t C2VDAComponent::start() {
     if (mState != State::LOADED) {
         return C2_BAD_STATE;  // start() is only supported when component is in LOADED state.
     }
 
-    getParameters();
+    fetchParametersFromIntf();
     base::WaitableEvent done(base::WaitableEvent::ResetPolicy::AUTOMATIC,
                              base::WaitableEvent::InitialState::NOT_SIGNALED);
-    mTaskRunner->PostTask(
-            FROM_HERE,
-            base::Bind(&C2VDAComponent::onStart, base::Unretained(this), mCodecProfile, &done));
+    mTaskRunner->PostTask(FROM_HERE, base::Bind(&C2VDAComponent::onStart, base::Unretained(this),
+                                                mCodecProfile, &done));
     done.Wait();
     if (mVDAInitResult != VideoDecodeAcceleratorAdaptor::Result::SUCCESS) {
         ALOGE("Failed to start component due to VDA error: %d", static_cast<int>(mVDAInitResult));
@@ -555,7 +1106,7 @@ status_t C2VDAComponent::start() {
     return C2_OK;
 }
 
-status_t C2VDAComponent::stop() {
+c2_status_t C2VDAComponent::stop() {
     if (!(mState == State::RUNNING || mState == State::ERROR)) {
         return C2_BAD_STATE;  // component is already in stopped state.
     }
@@ -569,94 +1120,246 @@ status_t C2VDAComponent::stop() {
     return C2_OK;
 }
 
-void C2VDAComponent::reset() {
-    stop();
-    // TODO(johnylin): what is the use case for calling reset() instead of stop()?
+c2_status_t C2VDAComponent::reset() {
+    return stop();
+    // TODO(johnylin): reset is different than stop that it could be called in any state.
+    // TODO(johnylin): when reset is called, set ComponentInterface to default values.
 }
 
-void C2VDAComponent::release() {
+c2_status_t C2VDAComponent::release() {
     // TODO(johnylin): what should we do for release?
+    return C2_OMITTED;
 }
 
 std::shared_ptr<C2ComponentInterface> C2VDAComponent::intf() {
     return mIntf;
 }
 
-void C2VDAComponent::providePictureBuffers(
-        uint32_t pixelFormat, uint32_t minNumBuffers, const media::Size& codedSize) {
-    UNUSED(pixelFormat);
-    UNUSED(minNumBuffers);
-    UNUSED(codedSize);
+void C2VDAComponent::providePictureBuffers(uint32_t pixelFormat, uint32_t minNumBuffers,
+                                           const media::Size& codedSize) {
+    // Uses coded size for crop rect while it is not available.
+    auto format = std::make_unique<VideoFormat>(pixelFormat, minNumBuffers, codedSize,
+                                                media::Rect(codedSize));
+
+    // Set mRequestedVisibleRect to default.
+    mRequestedVisibleRect = media::Rect();
+
+    mTaskRunner->PostTask(FROM_HERE, base::Bind(&C2VDAComponent::onOutputFormatChanged,
+                                                base::Unretained(this), base::Passed(&format)));
 }
 
 void C2VDAComponent::dismissPictureBuffer(int32_t pictureBufferId) {
     UNUSED(pictureBufferId);
+    // no ops
 }
 
-void C2VDAComponent::pictureReady(
-        int32_t pictureBufferId, int32_t bitstreamId, const media::Rect& cropRect) {
+void C2VDAComponent::pictureReady(int32_t pictureBufferId, int32_t bitstreamId,
+                                  const media::Rect& cropRect) {
     UNUSED(pictureBufferId);
     UNUSED(bitstreamId);
-    UNUSED(cropRect);
+
+    if (mRequestedVisibleRect != cropRect) {
+        mRequestedVisibleRect = cropRect;
+        mTaskRunner->PostTask(FROM_HERE, base::Bind(&C2VDAComponent::onVisibleRectChanged,
+                                                    base::Unretained(this), cropRect));
+    }
+
+    mTaskRunner->PostTask(FROM_HERE,
+                          base::Bind(&C2VDAComponent::onOutputBufferDone, base::Unretained(this),
+                                     pictureBufferId, bitstreamId));
 }
 
 void C2VDAComponent::notifyEndOfBitstreamBuffer(int32_t bitstreamId) {
-    UNUSED(bitstreamId);
+    mTaskRunner->PostTask(FROM_HERE, base::Bind(&C2VDAComponent::onInputBufferDone,
+                                                base::Unretained(this), bitstreamId));
 }
 
 void C2VDAComponent::notifyFlushDone() {
+    mTaskRunner->PostTask(FROM_HERE,
+                          base::Bind(&C2VDAComponent::onDrainDone, base::Unretained(this)));
 }
 
 void C2VDAComponent::notifyResetDone() {
     mTaskRunner->PostTask(FROM_HERE,
-                          base::Bind(&C2VDAComponent::onStopDone, base::Unretained(this)));
+                          base::Bind(&C2VDAComponent::onResetDone, base::Unretained(this)));
 }
 
 void C2VDAComponent::notifyError(VideoDecodeAcceleratorAdaptor::Result error) {
-    UNUSED(error);
+    ALOGE("Got notifyError from VDA error=%d", error);
+    c2_status_t err;
+    switch (error) {
+    case VideoDecodeAcceleratorAdaptor::Result::ILLEGAL_STATE:
+        err = C2_BAD_STATE;
+        break;
+    case VideoDecodeAcceleratorAdaptor::Result::INVALID_ARGUMENT:
+    case VideoDecodeAcceleratorAdaptor::Result::UNREADABLE_INPUT:
+        err = C2_BAD_VALUE;
+        break;
+    case VideoDecodeAcceleratorAdaptor::Result::PLATFORM_FAILURE:
+        err = C2_CORRUPTED;
+        break;
+    case VideoDecodeAcceleratorAdaptor::Result::INSUFFICIENT_RESOURCES:
+        err = C2_NO_MEMORY;
+        break;
+    case VideoDecodeAcceleratorAdaptor::Result::SUCCESS:
+        ALOGE("Shouldn't get SUCCESS err code in NotifyError(). Skip it...");
+        return;
+    }
+    reportError(err);
+}
+
+void C2VDAComponent::reportFinishedWorkIfAny() {
+    DCHECK(mTaskRunner->BelongsToCurrentThread());
+    std::vector<std::unique_ptr<C2Work>> finishedWorks;
+
+    // Work should be reported as done if both input and output buffer are returned by VDA.
+
+    // Note that not every input buffer has matched output (ex. CSD header for H.264).
+    // However, the timestamp is guaranteed to be monotonic increasing for buffers in display order.
+    // That is, since VDA output is in display order, if we get a returned output with timestamp T,
+    // it implies all works with timestamp <= T are done.
+    auto iter = mPendingWorks.begin();
+    while (iter != mPendingWorks.end()) {
+        if (isWorkDone(iter->get())) {
+            iter->get()->result = C2_OK;
+            finishedWorks.emplace_back(std::move(*iter));
+            iter = mPendingWorks.erase(iter);
+        } else {
+            ++iter;
+        }
+    }
+
+    if (!finishedWorks.empty()) {
+        mListener->onWorkDone_nb(shared_from_this(), std::move(finishedWorks));
+    }
+}
+
+bool C2VDAComponent::isWorkDone(const C2Work* work) const {
+    if (!work->input.buffers.empty()) {
+        return false;  // Input buffer is still owned by VDA.
+    }
+    if (mLastOutputTimestamp < 0) {
+        return false;  // No output buffer is returned yet.
+    }
+    if (work->input.ordinal.timestamp > static_cast<uint64_t>(mLastOutputTimestamp)) {
+        return false;  // Output buffer is not returned by VDA yet.
+    }
+    return true;  // Output buffer is returned, or it has no related output buffer.
+}
+
+void C2VDAComponent::reportAbandonedWorks() {
+    DCHECK(mTaskRunner->BelongsToCurrentThread());
+    std::vector<std::unique_ptr<C2Work>> abandonedWorks;
+
+    while (!mPendingWorks.empty()) {
+        std::unique_ptr<C2Work> work(std::move(mPendingWorks.front()));
+        mPendingWorks.pop_front();
+
+        work->result = static_cast<c2_status_t>(-1);  // What should this value be?
+        // When the work is abandoned, the input buffers vector shall be cleared by component.
+        work->input.buffers.clear();
+        abandonedWorks.emplace_back(std::move(work));
+    }
+
+    if (!abandonedWorks.empty()) {
+        mListener->onWorkDone_nb(shared_from_this(), std::move(abandonedWorks));
+    }
+}
+
+void C2VDAComponent::reportError(c2_status_t error) {
+    uint32_t reported_error = -error;
+    // Why onError_nb takes uint32_t while c2_status_t is mostly negative numbers?
+    mListener->onError_nb(shared_from_this(), reported_error);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-status_t C2VDAComponentStore::createComponent(
-        C2String name, std::shared_ptr<C2Component>* const component) {
-    UNUSED(name);
-    UNUSED(component);
-    return C2_NOT_IMPLEMENTED;
+// Neglect flexible flag while matching parameter indices.
+#define CASE(paramType)                                                    \
+    case paramType::coreIndex:                                             \
+        return std::unique_ptr<C2StructDescriptor>(new C2StructDescriptor{ \
+                paramType::coreIndex,                                      \
+                paramType::fieldList,                                      \
+        })
+
+class C2VDAComponentStore::ParamReflector : public C2ParamReflector {
+public:
+    virtual std::unique_ptr<C2StructDescriptor> describe(C2Param::BaseIndex coreIndex) override {
+        switch (coreIndex.coreIndex()) {
+            //CASE(C2ComponentDomainInfo);  //TODO: known codec2 framework bug
+            CASE(C2StreamFormatConfig);
+            CASE(C2VideoSizeStreamInfo);
+            CASE(C2PortMimeConfig);
+            CASE(C2MaxVideoSizeHintPortSetting);
+        }
+        return nullptr;
+    }
+};
+
+#undef CASE
+
+// TODO(johnylin): implement C2VDAComponentStore
+C2VDAComponentStore::C2VDAComponentStore() : mParamReflector(std::make_shared<ParamReflector>()) {}
+
+C2String C2VDAComponentStore::getName() const {
+    return "android.componentStore.v4l2";
 }
 
-status_t C2VDAComponentStore::createInterface(
+c2_status_t C2VDAComponentStore::createComponent(C2String name,
+                                                 std::shared_ptr<C2Component>* const component) {
+    UNUSED(name);
+    UNUSED(component);
+    return C2_OMITTED;
+}
+
+c2_status_t C2VDAComponentStore::createInterface(
         C2String name, std::shared_ptr<C2ComponentInterface>* const interface) {
     interface->reset(new C2VDAComponentIntf(name, 12345));
     return C2_OK;
 }
 
-std::vector<std::unique_ptr<const C2ComponentInfo>> C2VDAComponentStore::getComponents() {
-    return std::vector<std::unique_ptr<const C2ComponentInfo>>();
+std::vector<std::shared_ptr<const C2Component::Traits>> C2VDAComponentStore::listComponents() {
+    return std::vector<std::shared_ptr<const C2Component::Traits>>();
 }
 
-status_t C2VDAComponentStore::copyBuffer(
-        std::shared_ptr<C2GraphicBuffer> src, std::shared_ptr<C2GraphicBuffer> dst) {
+c2_status_t C2VDAComponentStore::copyBuffer(std::shared_ptr<C2GraphicBuffer> src,
+                                            std::shared_ptr<C2GraphicBuffer> dst) {
     UNUSED(src);
     UNUSED(dst);
-    return C2_NOT_IMPLEMENTED;
+    return C2_OMITTED;
 }
 
-status_t C2VDAComponentStore::query_sm(
+std::shared_ptr<C2ParamReflector> C2VDAComponentStore::getParamReflector() const {
+    return mParamReflector;
+}
+
+c2_status_t C2VDAComponentStore::querySupportedParams_nb(
+        std::vector<std::shared_ptr<C2ParamDescriptor>>* const params) const {
+    UNUSED(params);
+    return C2_OMITTED;
+}
+
+c2_status_t C2VDAComponentStore::querySupportedValues_sm(
+        std::vector<C2FieldSupportedValuesQuery>& fields) const {
+    UNUSED(fields);
+    return C2_OMITTED;
+}
+
+c2_status_t C2VDAComponentStore::query_sm(
         const std::vector<C2Param* const>& stackParams,
         const std::vector<C2Param::Index>& heapParamIndices,
         std::vector<std::unique_ptr<C2Param>>* const heapParams) const {
     UNUSED(stackParams);
     UNUSED(heapParamIndices);
     UNUSED(heapParams);
-    return C2_NOT_IMPLEMENTED;
+    return C2_OMITTED;
 }
 
-status_t C2VDAComponentStore::config_nb(
-        const std::vector<C2Param* const> &params,
-        std::list<std::unique_ptr<C2SettingResult>>* const failures) {
+c2_status_t C2VDAComponentStore::config_sm(
+        const std::vector<C2Param* const>& params,
+        std::vector<std::unique_ptr<C2SettingResult>>* const failures) {
     UNUSED(params);
     UNUSED(failures);
-    return C2_NOT_IMPLEMENTED;
+    return C2_OMITTED;
 }
 
 }  // namespace android
