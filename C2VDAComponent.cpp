@@ -5,7 +5,12 @@
 //#define LOG_NDEBUG 0
 #define LOG_TAG "C2VDAComponent"
 
+#ifdef V4L2_CODEC2_ARC
+#include <C2VDAAdaptorProxy.h>
+#else
 #include <C2VDAAdaptor.h>
+#endif
+
 #define __C2_GENERATE_GLOBAL_VARS__
 #include <C2VDAComponent.h>
 #include <C2VDASupport.h>
@@ -97,8 +102,8 @@ bool findUint32FromPrimitiveValues(const uint32_t& v, const C2FieldSupportedValu
 }
 
 // Mask against 30 bits to avoid (undefined) wraparound on signed integer.
-int32_t frameIndexToBitstreamId(uint64_t frameIndex) {
-    return static_cast<int32_t>(frameIndex & 0x3FFFFFFF);
+int32_t frameIndexToBitstreamId(c2_cntr64_t frameIndex) {
+    return static_cast<int32_t>(frameIndex.peeku() & 0x3FFFFFFF);
 }
 
 const C2String kH264DecoderName = "v4l2.h264.decode";
@@ -134,7 +139,11 @@ C2VDAComponentIntf::C2VDAComponentIntf(C2String name, c2_node_id_t id)
     // Get supported profiles from VDA.
     // TODO: re-think the suitable method of getting supported profiles for both pure Android and
     //       ARC++.
+#ifdef V4L2_CODEC2_ARC
+    mSupportedProfiles = arc::C2VDAAdaptorProxy::GetSupportedProfiles(inputFormatFourcc);
+#else
     mSupportedProfiles = C2VDAAdaptor::GetSupportedProfiles(inputFormatFourcc);
+#endif
     if (mSupportedProfiles.empty()) {
         ALOGE("No supported profile from input format: %u", inputFormatFourcc);
         mInitStatus = C2_BAD_VALUE;
@@ -216,7 +225,7 @@ c2_node_id_t C2VDAComponentIntf::getId() const {
 }
 
 c2_status_t C2VDAComponentIntf::query_vb(
-        const std::vector<C2Param* const>& stackParams,
+        const std::vector<C2Param*>& stackParams,
         const std::vector<C2Param::Index>& heapParamIndices, c2_blocking_t mayBlock,
         std::vector<std::unique_ptr<C2Param>>* const heapParams) const {
     UNUSED(mayBlock);
@@ -252,7 +261,7 @@ c2_status_t C2VDAComponentIntf::query_vb(
 }
 
 c2_status_t C2VDAComponentIntf::config_vb(
-        const std::vector<C2Param* const>& params, c2_blocking_t mayBlock,
+        const std::vector<C2Param*>& params, c2_blocking_t mayBlock,
         std::vector<std::unique_ptr<C2SettingResult>>* const failures) {
     UNUSED(mayBlock);
     c2_status_t err = C2_OK;
@@ -451,7 +460,7 @@ C2VDAGraphicBuffer::~C2VDAGraphicBuffer() {
     }
 }
 
-C2VDAComponent::VideoFormat::VideoFormat(uint32_t pixelFormat, uint32_t minNumBuffers,
+C2VDAComponent::VideoFormat::VideoFormat(HalPixelFormat pixelFormat, uint32_t minNumBuffers,
                                          media::Size codedSize, media::Rect visibleRect)
       : mPixelFormat(pixelFormat),
         mMinNumBuffers(minNumBuffers),
@@ -494,7 +503,7 @@ C2VDAComponent::~C2VDAComponent() {
 
 void C2VDAComponent::fetchParametersFromIntf() {
     C2StreamFormatConfig::input codecProfile;
-    std::vector<C2Param* const> stackParams{&codecProfile};
+    std::vector<C2Param*> stackParams{&codecProfile};
     CHECK_EQ(mIntf->query_vb(stackParams, {}, C2_DONT_BLOCK, nullptr), C2_OK);
     // The value should be guaranteed to be within media::VideoCodecProfile enum range by component
     // interface.
@@ -505,7 +514,11 @@ void C2VDAComponent::fetchParametersFromIntf() {
 void C2VDAComponent::onCreate() {
     DCHECK(mTaskRunner->BelongsToCurrentThread());
     ALOGV("onCreate");
+#ifdef V4L2_CODEC2_ARC
+    mVDAAdaptor.reset(new arc::C2VDAAdaptorProxy());
+#else
     mVDAAdaptor.reset(new C2VDAAdaptor());
+#endif
 }
 
 void C2VDAComponent::onDestroy() {
@@ -565,15 +578,15 @@ void C2VDAComponent::onDequeueWork() {
     mQueue.pop();
 
     // Send input buffer to VDA for decode.
-    // Use frame_index as bitstreamId.
+    // Use frameIndex as bitstreamId.
     CHECK_EQ(work->input.buffers.size(), 1u);
     C2ConstLinearBlock linearBlock = work->input.buffers.front()->data().linearBlocks().front();
     if (linearBlock.size() > 0) {
-        int32_t bitstreamId = frameIndexToBitstreamId(work->input.ordinal.frame_index);
+        int32_t bitstreamId = frameIndexToBitstreamId(work->input.ordinal.frameIndex);
         sendInputBufferToAccelerator(linearBlock, bitstreamId);
     }
 
-    if (work->input.flags & C2BufferPack::FLAG_END_OF_STREAM) {
+    if (work->input.flags & C2FrameData::FLAG_END_OF_STREAM) {
         mVDAAdaptor->flush();
         mComponentState = ComponentState::DRAINING;
     }
@@ -657,9 +670,10 @@ void C2VDAComponent::onOutputBufferDone(int32_t pictureBufferId, int32_t bitstre
             info->mGraphicBlock, base::Bind(&C2VDAComponent::returnOutputBuffer,
                                             mWeakThisFactory.GetWeakPtr(), pictureBufferId)));
     work->worklets.front()->output.ordinal = work->input.ordinal;
-    work->worklets_processed = 1u;
+    work->workletsProcessed = 1u;
 
-    int64_t currentTimestamp = base::checked_cast<int64_t>(work->input.ordinal.timestamp);
+    // TODO: this does not work for timestamps as they can wrap around
+    int64_t currentTimestamp = base::checked_cast<int64_t>(work->input.ordinal.timestamp.peek());
     CHECK_GE(currentTimestamp, mLastOutputTimestamp);
     mLastOutputTimestamp = currentTimestamp;
 
@@ -671,19 +685,19 @@ void C2VDAComponent::onDrain() {
     ALOGV("onDrain");
     EXPECT_STATE_OR_RETURN_ON_ERROR(STARTED);
 
-    // Set input flag as C2BufferPack::FLAG_END_OF_STREAM to the last queued work. If mQueue is
+    // Set input flag as C2FrameData::FLAG_END_OF_STREAM to the last queued work. If mQueue is
     // empty, set to the last work in mPendingWorks and then signal flush immediately.
     if (!mQueue.empty()) {
-        mQueue.back()->input.flags = static_cast<C2BufferPack::flags_t>(
-                mQueue.back()->input.flags | C2BufferPack::FLAG_END_OF_STREAM);
+        mQueue.back()->input.flags = static_cast<C2FrameData::flags_t>(
+                mQueue.back()->input.flags | C2FrameData::FLAG_END_OF_STREAM);
     } else if (!mPendingWorks.empty()) {
         C2Work* work = getPendingWorkLastToFinish();
         if (!work) {
             reportError(C2_CORRUPTED);
             return;
         }
-        mPendingWorks.back()->input.flags = static_cast<C2BufferPack::flags_t>(
-                mPendingWorks.back()->input.flags | C2BufferPack::FLAG_END_OF_STREAM);
+        mPendingWorks.back()->input.flags = static_cast<C2FrameData::flags_t>(
+                mPendingWorks.back()->input.flags | C2FrameData::FLAG_END_OF_STREAM);
         mVDAAdaptor->flush();
         mComponentState = ComponentState::DRAINING;
     } else {
@@ -821,7 +835,7 @@ void C2VDAComponent::sendInputBufferToAccelerator(const C2ConstLinearBlock& inpu
 C2Work* C2VDAComponent::getPendingWorkByBitstreamId(int32_t bitstreamId) {
     auto workIter = std::find_if(mPendingWorks.begin(), mPendingWorks.end(),
                                  [bitstreamId](const std::unique_ptr<C2Work>& w) {
-                                     return frameIndexToBitstreamId(w->input.ordinal.frame_index) ==
+                                     return frameIndexToBitstreamId(w->input.ordinal.frameIndex) ==
                                             bitstreamId;
                                  });
 
@@ -860,8 +874,8 @@ void C2VDAComponent::onOutputFormatChanged(std::unique_ptr<VideoFormat> format) 
     EXPECT_RUNNING_OR_RETURN_ON_ERROR();
 
     ALOGV("New output format(pixel_format=0x%x, min_num_buffers=%u, coded_size=%s, crop_rect=%s)",
-          format->mPixelFormat, format->mMinNumBuffers, format->mCodedSize.ToString().c_str(),
-          format->mVisibleRect.ToString().c_str());
+          static_cast<uint32_t>(format->mPixelFormat), format->mMinNumBuffers,
+          format->mCodedSize.ToString().c_str(), format->mVisibleRect.ToString().c_str());
 
     for (auto& info : mGraphicBlocks) {
         if (info.mState == GraphicBlockInfo::State::OWNED_BY_ACCELERATOR)
@@ -880,6 +894,7 @@ void C2VDAComponent::tryChangeOutputFormat() {
 
     // Change the output format only after all output buffers are returned
     // from clients.
+    // TODO(johnylin): don't need to wait for new proposed buffer flow.
     for (const auto& info : mGraphicBlocks) {
         if (info.mState == GraphicBlockInfo::State::OWNED_BY_CLIENT) {
             ALOGV("wait buffer: %d for output format change", info.mBlockId);
@@ -887,28 +902,18 @@ void C2VDAComponent::tryChangeOutputFormat() {
         }
     }
 
-    uint32_t colorFormat;
-    int bufferFormat;
-    switch (mPendingOutputFormat->mPixelFormat) {
-    case HAL_PIXEL_FORMAT_YCbCr_420_888:
-        colorFormat = kColorFormatYUV420Flexible;
-        bufferFormat = HAL_PIXEL_FORMAT_YCbCr_420_888;
-        break;
-    default:
-        ALOGE("pixel format: 0x%x is not supported", mPendingOutputFormat->mPixelFormat);
-        reportError(C2_OMITTED);
-        return;
-    }
+    CHECK_EQ(mPendingOutputFormat->mPixelFormat, HalPixelFormat::YCbCr_420_888);
 
     mOutputFormat.mPixelFormat = mPendingOutputFormat->mPixelFormat;
     mOutputFormat.mMinNumBuffers = mPendingOutputFormat->mMinNumBuffers;
     mOutputFormat.mCodedSize = mPendingOutputFormat->mCodedSize;
 
     setOutputFormatCrop(mPendingOutputFormat->mVisibleRect);
-    mColorFormat = colorFormat;
+    mColorFormat = kColorFormatYUV420Flexible;
 
-    c2_status_t err =
-            allocateBuffersFromBlockAllocator(mPendingOutputFormat->mCodedSize, bufferFormat);
+    c2_status_t err = allocateBuffersFromBlockAllocator(
+            mPendingOutputFormat->mCodedSize,
+            static_cast<uint32_t>(mPendingOutputFormat->mPixelFormat));
     if (err != C2_OK) {
         reportError(err);
         return;
@@ -921,7 +926,7 @@ void C2VDAComponent::tryChangeOutputFormat() {
 }
 
 c2_status_t C2VDAComponent::allocateBuffersFromBlockAllocator(const media::Size& size,
-                                                              int pixelFormat) {
+                                                              uint32_t pixelFormat) {
     ALOGV("allocateBuffersFromBlockAllocator(%s, 0x%x)", size.ToString().c_str(), pixelFormat);
 
     size_t bufferCount = mOutputFormat.mMinNumBuffers + kDpbOutputBufferExtraCount;
@@ -983,21 +988,31 @@ void C2VDAComponent::appendOutputBuffer(std::shared_ptr<C2GraphicBlock> block) {
         offsets[i] = static_cast<uint32_t>(planeAddress - baseAddress);
     }
 
+    bool crcb = false;
     if (layout.numPlanes == 3 &&
         offsets[C2PlanarLayout::PLANE_U] > offsets[C2PlanarLayout::PLANE_V]) {
         // YCrCb format
         std::swap(offsets[C2PlanarLayout::PLANE_U], offsets[C2PlanarLayout::PLANE_V]);
+        crcb = true;
     }
 
+    bool semiplanar = false;
     uint32_t passedNumPlanes = layout.numPlanes;
     if (layout.planes[C2PlanarLayout::PLANE_U].colInc == 2) {  // chroma_step
         // Semi-planar format
         passedNumPlanes--;
+        semiplanar = true;
     }
 
     for (uint32_t i = 0; i < passedNumPlanes; ++i) {
         ALOGV("plane %u: stride: %d, offset: %u", i, layout.planes[i].rowInc, offsets[i]);
     }
+#ifdef V4L2_CODEC2_ARC
+    info.mPixelFormat = arc::C2VDAAdaptorProxy::ResolveBufferFormat(crcb, semiplanar);
+#else
+    info.mPixelFormat = C2VDAAdaptor::ResolveBufferFormat(crcb, semiplanar);
+#endif
+    ALOGV("HAL pixel format: 0x%x", static_cast<uint32_t>(info.mPixelFormat));
 
     base::ScopedFD passedHandle(dup(info.mGraphicBlock->handle()->data[0]));
     if (!passedHandle.is_valid()) {
@@ -1024,7 +1039,8 @@ void C2VDAComponent::sendOutputBufferToAccelerator(GraphicBlockInfo* info) {
     // is_valid() is true for the first time the buffer is passed to VDA. In that case, VDA needs to
     // import the buffer first.
     if (info->mHandle.is_valid()) {
-        mVDAAdaptor->importBufferForPicture(info->mBlockId, info->mHandle.release(), info->mPlanes);
+        mVDAAdaptor->importBufferForPicture(info->mBlockId, info->mPixelFormat,
+                                            info->mHandle.release(), info->mPlanes);
     } else {
         mVDAAdaptor->reusePictureBuffer(info->mBlockId);
     }
@@ -1138,11 +1154,11 @@ std::shared_ptr<C2ComponentInterface> C2VDAComponent::intf() {
     return mIntf;
 }
 
-void C2VDAComponent::providePictureBuffers(uint32_t pixelFormat, uint32_t minNumBuffers,
-                                           const media::Size& codedSize) {
+void C2VDAComponent::providePictureBuffers(uint32_t minNumBuffers, const media::Size& codedSize) {
+    // Always use fexible pixel 420 format YCbCr_420_888 in Android.
     // Uses coded size for crop rect while it is not available.
-    auto format = std::make_unique<VideoFormat>(pixelFormat, minNumBuffers, codedSize,
-                                                media::Rect(codedSize));
+    auto format = std::make_unique<VideoFormat>(HalPixelFormat::YCbCr_420_888, minNumBuffers,
+                                                codedSize, media::Rect(codedSize));
 
     // Set mRequestedVisibleRect to default.
     mRequestedVisibleRect = media::Rect();
@@ -1348,7 +1364,7 @@ c2_status_t C2VDAComponentStore::querySupportedValues_sm(
 }
 
 c2_status_t C2VDAComponentStore::query_sm(
-        const std::vector<C2Param* const>& stackParams,
+        const std::vector<C2Param*>& stackParams,
         const std::vector<C2Param::Index>& heapParamIndices,
         std::vector<std::unique_ptr<C2Param>>* const heapParams) const {
     UNUSED(stackParams);
@@ -1358,7 +1374,7 @@ c2_status_t C2VDAComponentStore::query_sm(
 }
 
 c2_status_t C2VDAComponentStore::config_sm(
-        const std::vector<C2Param* const>& params,
+        const std::vector<C2Param*>& params,
         std::vector<std::unique_ptr<C2SettingResult>>* const failures) {
     UNUSED(params);
     UNUSED(failures);

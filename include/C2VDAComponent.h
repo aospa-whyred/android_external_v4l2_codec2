@@ -40,11 +40,11 @@ public:
     virtual C2String getName() const override;
     virtual c2_node_id_t getId() const override;
     virtual c2_status_t query_vb(
-            const std::vector<C2Param* const>& stackParams,
+            const std::vector<C2Param*>& stackParams,
             const std::vector<C2Param::Index>& heapParamIndices, c2_blocking_t mayBlock,
             std::vector<std::unique_ptr<C2Param>>* const heapParams) const override;
     virtual c2_status_t config_vb(
-            const std::vector<C2Param* const>& params, c2_blocking_t mayBlock,
+            const std::vector<C2Param*>& params, c2_blocking_t mayBlock,
             std::vector<std::unique_ptr<C2SettingResult>>* const failures) override;
     virtual c2_status_t createTunnel_sm(c2_node_id_t targetComponent) override;
     virtual c2_status_t releaseTunnel_sm(c2_node_id_t targetComponent) override;
@@ -122,7 +122,7 @@ public:
     virtual std::shared_ptr<C2ComponentInterface> intf() override;
 
     // Implementation of VideDecodeAcceleratorAdaptor::Client interface
-    virtual void providePictureBuffers(uint32_t pixelFormat, uint32_t minNumBuffers,
+    virtual void providePictureBuffers(uint32_t minNumBuffers,
                                        const media::Size& codedSize) override;
     virtual void dismissPictureBuffer(int32_t pictureBufferId) override;
     virtual void pictureReady(int32_t pictureBufferId, int32_t bitstreamId,
@@ -181,6 +181,8 @@ private:
         State mState = State::OWNED_BY_COMPONENT;
         // Graphic block buffer allocated from allocator. This should be reused.
         std::shared_ptr<C2GraphicBlock> mGraphicBlock;
+        // HAL pixel format used while importing to VDA.
+        HalPixelFormat mPixelFormat;
         // The handle dupped from graphic block for importing to VDA.
         base::ScopedFD mHandle;
         // VideoFramePlane information for importing to VDA.
@@ -188,13 +190,13 @@ private:
     };
 
     struct VideoFormat {
-        uint32_t mPixelFormat = 0;
+        HalPixelFormat mPixelFormat = HalPixelFormat::UNKNOWN;
         uint32_t mMinNumBuffers = 0;
         media::Size mCodedSize;
         media::Rect mVisibleRect;
 
         VideoFormat() {}
-        VideoFormat(uint32_t pixelFormat, uint32_t minNumBuffers, media::Size codedSize,
+        VideoFormat(HalPixelFormat pixelFormat, uint32_t minNumBuffers, media::Size codedSize,
                     media::Rect visibleRect);
     };
 
@@ -238,7 +240,7 @@ private:
     // Try to apply the output format change.
     void tryChangeOutputFormat();
     // Allocate output buffers (graphic blocks) from block allocator.
-    c2_status_t allocateBuffersFromBlockAllocator(const media::Size& size, int pixelFormat);
+    c2_status_t allocateBuffersFromBlockAllocator(const media::Size& size, uint32_t pixelFormat);
     // Append allocated buffer (graphic block) to mGraphicBlocks.
     void appendOutputBuffer(std::shared_ptr<C2GraphicBlock> block);
 
@@ -335,11 +337,11 @@ public:
     c2_status_t querySupportedValues_sm(
             std::vector<C2FieldSupportedValuesQuery>& fields) const override;
 
-    c2_status_t query_sm(const std::vector<C2Param* const>& stackParams,
+    c2_status_t query_sm(const std::vector<C2Param*>& stackParams,
                          const std::vector<C2Param::Index>& heapParamIndices,
                          std::vector<std::unique_ptr<C2Param>>* const heapParams) const override;
 
-    c2_status_t config_sm(const std::vector<C2Param* const>& params,
+    c2_status_t config_sm(const std::vector<C2Param*>& params,
                           std::vector<std::unique_ptr<C2SettingResult>>* const failures) override;
 
 private:
