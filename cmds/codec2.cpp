@@ -271,7 +271,8 @@ status_t SimplePlayer::play(const sp<IMediaSource>& source) {
                 mProcessedWork.pop_front();
             }
 
-            if (work->workletsProcessed > 0) {
+            CHECK_EQ(work->worklets.size(), 1u);
+            if (work->worklets.front()->output.buffers.size() == 1u) {
                 int slot;
                 sp<Fence> fence;
                 std::shared_ptr<C2Buffer> output = work->worklets.front()->output.buffers[0];
@@ -313,12 +314,13 @@ status_t SimplePlayer::play(const sp<IMediaSource>& source) {
 #endif
             }
 
+            bool eos = work->worklets.front()->output.flags & C2FrameData::FLAG_END_OF_STREAM;
             // input buffers should be cleared in component side.
             CHECK(work->input.buffers.empty());
             work->worklets.clear();
             work->workletsProcessed = 0;
 
-            if (work->input.flags & C2FrameData::FLAG_END_OF_STREAM) {
+            if (eos) {
                 running.store(false);  // stop the thread
             }
 
@@ -334,7 +336,7 @@ status_t SimplePlayer::play(const sp<IMediaSource>& source) {
         size_t size = 0u;
         void* data = nullptr;
         int64_t timestamp = 0u;
-        MediaBuffer* buffer = nullptr;
+        MediaBufferBase* buffer = nullptr;
         sp<ABuffer> csd;
         if (!csds.empty()) {
             csd = std::move(csds.front());
