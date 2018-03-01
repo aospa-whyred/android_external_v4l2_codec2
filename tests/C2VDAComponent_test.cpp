@@ -451,7 +451,7 @@ TEST_P(C2VDAComponentParamTest, SimpleDecodeTest) {
             std::make_shared<C2VDAComponent>(mTestVideoFile->mComponentName, 0));
     ASSERT_EQ(component->setListener_vb(mListener, C2_DONT_BLOCK), C2_OK);
     std::unique_ptr<C2PortBlockPoolsTuning::output> pools =
-            C2PortBlockPoolsTuning::output::alloc_unique(
+            C2PortBlockPoolsTuning::output::AllocUnique(
                     {static_cast<uint64_t>(C2BlockPool::BASIC_GRAPHIC)});
     std::vector<std::unique_ptr<C2SettingResult>> result;
     ASSERT_EQ(component->intf()->config_vb({pools.get()}, C2_DONT_BLOCK, &result), C2_OK);
@@ -600,8 +600,8 @@ TEST_P(C2VDAComponentParamTest, SimpleDecodeTest) {
                     // TODO(johnylin): add test with drain with DRAIN_COMPONENT_NO_EOS when we know
                     //                 the actual use case of it.
                 } else {
-                    sp<MetaData> meta = buffer->meta_data();
-                    ASSERT_TRUE(meta->findInt64(kKeyTime, &timestamp));
+                    MetaDataBase &meta = buffer->meta_data();
+                    ASSERT_TRUE(meta.findInt64(kKeyTime, &timestamp));
                     size = buffer->size();
                     data = buffer->data();
                 }
