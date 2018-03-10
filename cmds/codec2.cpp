@@ -68,7 +68,7 @@ const std::string kComponentName = kH264DecoderName;
 class C2VDALinearBuffer : public C2Buffer {
 public:
     explicit C2VDALinearBuffer(const std::shared_ptr<C2LinearBlock>& block)
-          : C2Buffer({block->share(block->offset(), block->size(), ::android::C2Fence())}) {}
+          : C2Buffer({block->share(block->offset(), block->size(), ::C2Fence())}) {}
 };
 
 class Listener;
@@ -241,7 +241,7 @@ status_t SimplePlayer::play(const sp<IMediaSource>& source) {
     std::shared_ptr<C2Component> component(std::make_shared<C2VDAComponent>(kComponentName, 0));
     component->setListener_vb(mListener, C2_DONT_BLOCK);
     std::unique_ptr<C2PortBlockPoolsTuning::output> pools =
-            C2PortBlockPoolsTuning::output::alloc_unique(
+            C2PortBlockPoolsTuning::output::AllocUnique(
                     {static_cast<uint64_t>(C2BlockPool::BASIC_GRAPHIC)});
     std::vector<std::unique_ptr<C2SettingResult>> result;
     (void)component->intf()->config_vb({pools.get()}, C2_DONT_BLOCK, &result);
@@ -271,7 +271,8 @@ status_t SimplePlayer::play(const sp<IMediaSource>& source) {
                 mProcessedWork.pop_front();
             }
 
-            if (work->workletsProcessed > 0) {
+            CHECK_EQ(work->worklets.size(), 1u);
+            if (work->worklets.front()->output.buffers.size() == 1u) {
                 int slot;
                 sp<Fence> fence;
                 std::shared_ptr<C2Buffer> output = work->worklets.front()->output.buffers[0];
@@ -313,12 +314,13 @@ status_t SimplePlayer::play(const sp<IMediaSource>& source) {
 #endif
             }
 
+            bool eos = work->worklets.front()->output.flags & C2FrameData::FLAG_END_OF_STREAM;
             // input buffers should be cleared in component side.
             CHECK(work->input.buffers.empty());
             work->worklets.clear();
             work->workletsProcessed = 0;
 
-            if (work->input.flags & C2FrameData::FLAG_END_OF_STREAM) {
+            if (eos) {
                 running.store(false);  // stop the thread
             }
 
@@ -334,7 +336,7 @@ status_t SimplePlayer::play(const sp<IMediaSource>& source) {
         size_t size = 0u;
         void* data = nullptr;
         int64_t timestamp = 0u;
-        MediaBuffer* buffer = nullptr;
+        MediaBufferBase* buffer = nullptr;
         sp<ABuffer> csd;
         if (!csds.empty()) {
             csd = std::move(csds.front());
@@ -352,8 +354,8 @@ status_t SimplePlayer::play(const sp<IMediaSource>& source) {
 
                 break;
             }
-            sp<MetaData> meta = buffer->meta_data();
-            CHECK(meta->findInt64(kKeyTime, &timestamp));
+            MetaDataBase &meta = buffer->meta_data();
+            CHECK(meta.findInt64(kKeyTime, &timestamp));
 
             size = buffer->size();
             data = buffer->data();
