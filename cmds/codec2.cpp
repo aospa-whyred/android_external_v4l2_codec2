@@ -6,7 +6,14 @@
 #define LOG_TAG "codec2"
 
 #include <C2VDAComponent.h>
+
+#ifdef ANDROID_VERSION_NYC
+// Get allocators from NYC-specific implementation
 #include <C2VDASupport.h>
+#else
+// Get allocators from framework
+#include <C2PlatformSupport.h>
+#endif
 
 #include <C2Buffer.h>
 #include <C2BufferPriv.h>
@@ -55,9 +62,9 @@ using namespace std::chrono_literals;
 
 namespace {
 
-const std::string kH264DecoderName = "v4l2.h264.decode";
-const std::string kVP8DecoderName = "v4l2.vp8.decode";
-const std::string kVP9DecoderName = "v4l2.vp9.decode";
+const std::string kH264DecoderName = "c2.v4l2.h264.decoder";
+const std::string kVP8DecoderName = "c2.v4l2.vp8.decoder";
+const std::string kVP9DecoderName = "c2.v4l2.vp9.decoder";
 
 const int kWidth = 416;
 const int kHeight = 240;  // BigBuckBunny.mp4
@@ -145,7 +152,11 @@ SimplePlayer::SimplePlayer()
         mComposerClient(new SurfaceComposerClient) {
     CHECK_EQ(mComposerClient->initCheck(), OK);
 
-    std::shared_ptr<C2AllocatorStore> store = getCodec2VDAAllocatorStore();
+#ifdef ANDROID_VERSION_NYC
+    std::shared_ptr<C2AllocatorStore> store = GetCodec2VDAAllocatorStore();
+#else
+    std::shared_ptr<C2AllocatorStore> store = GetCodec2PlatformAllocatorStore();
+#endif
     CHECK_EQ(store->fetchAllocator(C2AllocatorStore::DEFAULT_LINEAR, &mLinearAlloc), C2_OK);
 
     mLinearBlockPool = std::make_shared<C2BasicLinearBlockPool>(mLinearAlloc);
@@ -336,7 +347,11 @@ status_t SimplePlayer::play(const sp<IMediaSource>& source) {
         size_t size = 0u;
         void* data = nullptr;
         int64_t timestamp = 0u;
+#ifdef ANDROID_VERSION_NYC
+        MediaBuffer* buffer = nullptr;
+#else
         MediaBufferBase* buffer = nullptr;
+#endif
         sp<ABuffer> csd;
         if (!csds.empty()) {
             csd = std::move(csds.front());
@@ -354,8 +369,13 @@ status_t SimplePlayer::play(const sp<IMediaSource>& source) {
 
                 break;
             }
+#ifdef ANDROID_VERSION_NYC
+            sp<MetaData> meta = buffer->meta_data();
+            CHECK(meta->findInt64(kKeyTime, &timestamp));
+#else
             MetaDataBase &meta = buffer->meta_data();
             CHECK(meta.findInt64(kKeyTime, &timestamp));
+#endif
 
             size = buffer->size();
             data = buffer->data();
