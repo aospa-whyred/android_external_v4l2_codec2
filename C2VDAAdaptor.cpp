@@ -56,8 +56,9 @@ VideoDecodeAcceleratorAdaptor::Result C2VDAAdaptor::initialize(
 
 void C2VDAAdaptor::decode(int32_t bitstreamId, int ashmemFd, off_t offset, uint32_t bytesUsed) {
     CHECK(mVDA);
-    mVDA->Decode(media::BitstreamBuffer(bitstreamId, base::SharedMemoryHandle(ashmemFd, true),
-                                        bytesUsed, offset));
+    ::base::SharedMemoryHandle shmHandle(::base::FileDescriptor(ashmemFd, true), 0u,
+                                         ::base::UnguessableToken::Create());
+    mVDA->Decode(media::BitstreamBuffer(bitstreamId, shmHandle, bytesUsed, offset));
 }
 
 void C2VDAAdaptor::assignPictureBuffers(uint32_t numOutputBuffers) {
@@ -71,7 +72,7 @@ void C2VDAAdaptor::assignPictureBuffers(uint32_t numOutputBuffers) {
 }
 
 void C2VDAAdaptor::importBufferForPicture(int32_t pictureBufferId, HalPixelFormat format,
-                                          int dmabufFd,
+                                          std::vector<::base::ScopedFD> dmabufFds,
                                           const std::vector<VideoFramePlane>& planes) {
     CHECK(mVDA);
     CHECK_LT(pictureBufferId, static_cast<int32_t>(mNumOutputBuffers));
@@ -90,7 +91,9 @@ void C2VDAAdaptor::importBufferForPicture(int32_t pictureBufferId, HalPixelForma
     }
 
     media::NativePixmapHandle handle;
-    handle.fds.emplace_back(base::FileDescriptor(dmabufFd, true));
+    for (auto& fd: dmabufFds)
+        handle.fds.emplace_back(::base::FileDescriptor(fd.release(), true));
+
     for (const auto& plane : planes) {
         handle.planes.emplace_back(plane.mStride, plane.mOffset, 0, 0);
     }
